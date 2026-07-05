@@ -1,0 +1,21 @@
+# Nintendo Switch keys -- NEVER commit these, even to a private repo
+.keys/
+keys.txt
+prod.keys
+dev.keys
+title.keys
+keyblobs*.txt
+key_retail.bin
+
+# Third-party tools -- not ours to redistribute
+hactool.exe
+hactoolnet.exe
+
+# Runtime artifacts
+*.log
+*.undo
+nswdb_cache.xml
+
+# Python
+__pycache__/
+*.pyc
