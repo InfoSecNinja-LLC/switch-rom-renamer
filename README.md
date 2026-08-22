@@ -158,7 +158,37 @@ uv run rename_roms.py "Z:/Games/Systems/Nintendo Switch/roms" ^
 
 # Disable the live progress bar (auto-disabled anyway when piped/redirected)
 uv run rename_roms.py "Z:/Games/Systems/Nintendo Switch/roms" --no-progress
+
+# Ignore the verify-cache and re-verify every file with hactool
+uv run rename_roms.py "Z:/Games/Systems/Nintendo Switch/roms" --full-scan
 ```
+
+### Verify-cache vs. `--full-scan`
+
+Every time hactool confirms a file's real id/version/content-type, that
+result is saved to `rename_roms.cache.json` alongside the file's size and
+modified-time. On the next run, if a file's size and modified-time are
+still exactly what's in the cache, it's trusted without calling hactool
+on it again — scanning a library that's already fully renamed becomes a
+fast, hactool-free pass instead of re-verifying every file from scratch.
+Only files that are new, changed, or not yet in the cache pay the
+hactool cost.
+
+This is deliberately **not** the same as trusting a name just because it
+*looks* canonical — a canonical-shaped filename can still carry a wrong
+title (leftover from an old buggy pass, or a hand edit), and shape alone
+can't tell the two apart. The cache only ever marks a file as trusted
+after hactool itself said so, so it can't reintroduce the class of bug
+this tool exists to catch. A cached BASE/UPDATE file can still donate its
+title to a sibling that needs one (e.g. new DLC added later) without
+itself being re-verified, and a title group where every file is a cache
+hit costs nothing at all — no hactool calls for it whatsoever.
+
+Pass `--full-scan` to ignore the cache and re-verify every file with
+hactool regardless of past runs (the cache is still refreshed from the
+results either way, so subsequent runs stay fast). The summary output
+breaks out how many "Already correct" files were fast-skipped via the
+cache vs. freshly verified.
 
 A live progress bar — files/titles done, elapsed time, ETA — is shown for
 each phase (scanning, resolving titles, resolving DLC names, renaming)
@@ -169,7 +199,10 @@ Always dry-run before `--apply`. Renames are logged to `rename_roms.log`
 and the last `--apply` session's rename map is written to
 `rename_roms.undo` so it can be reverted with `--undo` — but only the most
 recent session is kept, so undo before running `--apply` again if you want
-to keep that option open.
+to keep that option open. Every run also updates `rename_roms.cache.json`
+(see [Verify-cache vs. `--full-scan`](#verify-cache-vs---full-scan) below)
+— safe to delete any time, it just means the next run re-verifies
+everything with hactool once to rebuild it.
 
 **Windows path quoting note:** don't end a quoted path argument with a
 trailing backslash before the closing quote (e.g. `".\.keys\"`) — depending
@@ -214,9 +247,12 @@ The test suite covers the PFS0/HFS0 container parser, the raw CNMT parser
 (including its content meta type byte and content entry table), the raw
 NACP name parser, content-type-from-meta-type classification, the
 canonical filename-building logic for all four categories (BASE/UPDATE/
-DLC/UNKNOWN), and the full id/version and name-resolution pipelines
-(including per-DLC own-name resolution) against stubs in place of hactool
-— none of it requires hactool.exe, real keys, or real ROM files.
+DLC/UNKNOWN), the full id/version and name-resolution pipelines (including
+per-DLC own-name resolution), and the verify-cache (fingerprint/lookup
+validation, cache hits and misses, `--full-scan`, and cross-file name
+donation from a cached BASE/UPDATE to a sibling that still needs a name)
+against stubs in place of hactool — none of it requires hactool.exe, real
+keys, or real ROM files.
 
 ## Supported formats
 
