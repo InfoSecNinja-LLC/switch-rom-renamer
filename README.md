@@ -265,6 +265,7 @@ A new script `cleanup_switch_roms.py` is available to clean up your ROM collecti
 - Removing duplicate DLC files (based on file hash)
 - Keeping only the latest update for each game
 - Moving older files to the recycle bin
+- Removing duplicates with exact same name across filetypes (.nsp vs .nsz)
 
 Usage:
 ```

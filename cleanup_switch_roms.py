@@ -6,6 +6,7 @@ This script scans a folder of Switch ROMs and:
 1. Removes duplicate DLC files (based on file hash)
 2. Keeps only the latest update for each game
 3. Moves older files to the recycle bin
+4. Removes duplicates with exact same name across filetypes (.nsp vs .nsz)
 
 Usage: python cleanup_switch_roms.py <path_to_rom_folder> [--dry-run]
 """
@@ -122,10 +123,10 @@ def cleanup_roms(rom_folder, dry_run=False):
         logger.error(f"Error: Folder {rom_folder} does not exist")
         return
 
-    # Get all ROM files
+    # Get all ROM files (only .xci, .nsp, and .nsz supported now)
     rom_files = []
     for file in os.listdir(rom_folder):
-        if file.lower().endswith(('.xci', '.nsp', '.nca')):
+        if file.lower().endswith(('.xci', '.nsp', '.nsz')):
             rom_files.append(file)
 
     logger.info(f"Found {len(rom_files)} ROM files")
@@ -148,6 +149,7 @@ def cleanup_roms(rom_folder, dry_run=False):
         'duplicate_dlc': 0,
         'multiple_updates': 0,
         'multiple_bases': 0,
+        'same_name_across_types': 0,
         'moved_to_trash': 0
     }
 
@@ -228,7 +230,48 @@ def cleanup_roms(rom_folder, dry_run=False):
             if duplicate_count > 0:
                 logger.info(f"    Removed {duplicate_count} duplicate DLC files")
 
+        # Handle same name across filetypes (e.g., .nsp vs .nsz)
+        if len(files) > 1:
+            # Create a mapping of filename to extension
+            file_extensions = {}
+            for filename in files:
+                ext = Path(filename).suffix.lower()
+                file_extensions[filename] = ext
+
+            # Find pairs with same base name but different extensions
+            unique_names = set()
+            name_to_files = defaultdict(list)
+
+            for filename in files:
+                # Remove extension to get base name
+                base_name_no_ext = Path(filename).stem
+                name_to_files[base_name_no_ext].append(filename)
+
+            # Check if there are files with same base name but different extensions
+            for base_name, file_list in name_to_files.items():
+                if len(file_list) > 1:
+                    # Check if they have different extensions
+                    extensions = set([Path(f).suffix.lower() for f in file_list])
+                    if len(extensions) > 1:
+                        logger.info(f"    Found same base name with different extensions: {file_list}")
+
+                        # Keep the first one (we'll keep .nsp over .nsz or vice versa)
+                        # For simplicity, we'll remove all but the first one found
+                        files_to_remove.extend(file_list[1:])
+                        summary_stats['same_name_across_types'] += len(file_list) - 1
+
+                        if not dry_run:
+                            for filename in file_list[1:]:
+                                try:
+                                    send2trash.send2trash(os.path.join(rom_folder, filename))
+                                    summary_stats['moved_to_trash'] += 1
+                                except Exception as e:
+                                    logger.error(f"Failed to move {filename} to trash: {e}")
+
         files_to_delete.extend(files_to_remove)
+
+    # Remove duplicates from files_to_delete (in case same file was marked twice)
+    files_to_delete = list(set(files_to_delete))
 
     # Summary report
     logger.info("\n" + "="*50)
@@ -238,6 +281,7 @@ def cleanup_roms(rom_folder, dry_run=False):
     logger.info(f"Duplicate DLC files removed: {summary_stats['duplicate_dlc']}")
     logger.info(f"Multiple base files handled: {summary_stats['multiple_bases']}")
     logger.info(f"Multiple update files found: {summary_stats['multiple_updates']}")
+    logger.info(f"Same name across filetypes removed: {summary_stats['same_name_across_types']}")
 
     if dry_run:
         logger.info("DRY RUN MODE - No files were actually moved")
