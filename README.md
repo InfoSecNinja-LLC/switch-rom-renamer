@@ -258,3 +258,15 @@ keys, or real ROM files.
 
 `.nsp`, `.xci`, `.nsz`, `.xcz` — DLC and multi-title cartridges are
 supported the same way as base games/updates.
+
+## ROM Cleanup Script
+
+A new script `cleanup_switch_roms.py` is available to clean up your ROM collection by:
+- Removing duplicate DLC files (based on file hash)
+- Keeping only the latest update for each game
+- Moving older files to the recycle bin
+
+Usage:
+```
+python cleanup_switch_roms.py "K:\Games\Systems\Nintendo Switch\roms" [--dry-run]
+```
