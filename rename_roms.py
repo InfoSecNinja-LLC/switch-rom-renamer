@@ -1277,16 +1277,16 @@ def main() -> None:
 		epilog="""
 Examples:
   Dry-run a folder:
-	python rename_roms.py "Z:/Games/Systems/Nintendo Switch/roms"
+	python rename_roms.py --root "Z:/Games/Systems/Nintendo Switch/roms"
 
   Apply renames:
-	python rename_roms.py "Z:/Games/Systems/Nintendo Switch/roms" --apply
+	python rename_roms.py --root "Z:/Games/Systems/Nintendo Switch/roms" --apply
 
   Undo last apply:
-	python rename_roms.py "Z:/Games/Systems/Nintendo Switch/roms" --undo
+	python rename_roms.py --root "Z:/Games/Systems/Nintendo Switch/roms" --undo
 """,
 	)
-	parser.add_argument("dirs", nargs="+", metavar="DIR", help="ROM folder(s) to process")
+	parser.add_argument("--root", nargs="+", required=True, metavar="PATH", help="ROM folder(s) to process")
 	parser.add_argument("--apply", action="store_true", help="Apply renames (default is dry-run)")
 	parser.add_argument("--undo", action="store_true", help="Undo last --apply session")
 	parser.add_argument(
@@ -1315,7 +1315,7 @@ Examples:
 	)
 	args = parser.parse_args()
 
-	rom_dirs   = [Path(d) for d in args.dirs]
+	rom_dirs   = [Path(d) for d in args.root]
 	script_dir = Path(__file__).parent
 	log_file   = script_dir / "rename_roms.log"
 	undo_file  = script_dir / "rename_roms.undo"

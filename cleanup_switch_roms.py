@@ -8,7 +8,7 @@ This script scans a folder of Switch ROMs and:
 3. Moves older files to the recycle bin
 4. Removes duplicates with exact same name across filetypes (.nsp vs .nsz)
 
-Usage: python cleanup_switch_roms.py <path_to_rom_folder> [--dry-run]
+Usage: python cleanup_switch_roms.py --root <path_to_rom_folder> [--dry-run]
 """
 
 import os
@@ -22,11 +22,16 @@ import send2trash
 import argparse
 
 # Setup logging
+# Reconfigure stdout to UTF-8 so non-ASCII characters (e.g. the ✓ mark) don't
+# crash the console handler on Windows, where stdout defaults to cp1252.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('cleanup_roms.log'),
+        logging.FileHandler('cleanup_roms.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -298,17 +303,18 @@ def cleanup_roms(rom_folder, dry_run=False):
 
 def main():
     parser = argparse.ArgumentParser(description='Clean up Switch ROM collection')
-    parser.add_argument('rom_folder', help='Path to the ROM folder')
+    parser.add_argument('--root', required=True, metavar='PATH',
+                       help='Path to the ROM folder')
     parser.add_argument('--dry-run', action='store_true',
                        help='Show what would be done without actually moving files')
 
     args = parser.parse_args()
 
-    if not os.path.exists(args.rom_folder):
-        print(f"Error: Folder {args.rom_folder} does not exist")
+    if not os.path.exists(args.root):
+        print(f"Error: Folder {args.root} does not exist")
         sys.exit(1)
 
-    cleanup_roms(args.rom_folder, args.dry_run)
+    cleanup_roms(args.root, args.dry_run)
 
 if __name__ == "__main__":
     main()
