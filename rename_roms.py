@@ -113,6 +113,17 @@ phase whenever stdout is a real terminal -- automatically absent if output
 is redirected/piped, or forced off with --no-progress. It never touches
 rename_roms.log, which stays exactly as before.
 
+By default, a file hactool already confirmed correct on some PAST run
+(tracked in rename_roms.cache.json, keyed to that file's size+mtime) is
+trusted without calling hactool on it again -- see the "Verify-cache"
+paragraph in process_dirs. This is NOT the same as trusting a name just
+because it LOOKS canonical: a canonical-shaped filename can still carry a
+wrong title (e.g. leftover from an old buggy pass, or hand-edited), and
+this cache never marks a file as verified without hactool itself having
+said so first. Pass --full-scan to ignore the cache and re-verify every
+file with hactool regardless of past runs (the cache is still refreshed
+from the results either way).
+
 Usage:
 	python rename_roms.py <dir> [<dir> ...]              # Dry-run
 	python rename_roms.py <dir> --apply                  # Apply renames
@@ -120,10 +131,14 @@ Usage:
 	python rename_roms.py <dir> --hactool PATH            # hactool.exe location
 	python rename_roms.py <dir> --keys PATH               # prod.keys/keys.txt location
 	python rename_roms.py <dir> --no-progress             # Disable the progress bar
+	python rename_roms.py <dir> --full-scan               # Ignore the verify-cache, re-check everything
 
 Outputs (stored alongside this script):
-	rename_roms.log     Session log
-	rename_roms.undo    Undo map from last --apply
+	rename_roms.log          Session log
+	rename_roms.undo         Undo map from last --apply
+	rename_roms.cache.json   Verify-cache (path -> hactool-confirmed id/version/
+	                         content-type, keyed to that file's size+mtime) --
+	                         see the "Verify-cache" paragraph in process_dirs.
 
 Tests: see test_rename_roms.py (python -m unittest test_rename_roms -v).
 """
@@ -793,6 +808,53 @@ def build_new_stem(
 		return f"{title}{dlc_part} [{title_id}] [DLC][v{version}]"
 	return f"{title} [{title_id}] [UNKNOWN]"
 
+# ── Verify-cache (skip re-verifying files hactool already confirmed) ──────────
+
+def cache_fingerprint(path: Path, title_id: str, version: int, content_type: ContentType, base_id: str) -> dict:
+	"""
+	A cache entry recording that hactool itself already confirmed `path`
+	(at its CURRENT size/mtime) has this real id/version/content-type/
+	base-id -- ground truth from a past run, not a guess about the
+	filename. size+mtime (not just the path) are the key: if the file at
+	this path is ever replaced by different bytes, its mtime and/or size
+	will practically always change too, which invalidates the entry (see
+	cache_lookup) rather than silently trusting stale/wrong data.
+	"""
+	st = path.stat()
+	return {
+		"size": st.st_size, "mtime": st.st_mtime,
+		"title_id": title_id, "version": version,
+		"content_type": content_type.value, "base_id": base_id,
+	}
+
+
+def cache_lookup(cache: dict, path: Path) -> dict | None:
+	"""Returns the cached fingerprint for `path` if one exists, its
+	size/mtime still match the file on disk right now, AND its fields are
+	well-formed, else None. Never raises -- a missing file, an unreadable
+	file, or a malformed/incompatible entry (this cache file is plain
+	JSON someone could hand-edit or half-write) are all just a miss,
+	falling through to the normal hactool-verified path rather than
+	crashing the whole run over one bad entry."""
+	entry = cache.get(str(path))
+	if not isinstance(entry, dict):
+		return None
+	try:
+		st = path.stat()
+	except OSError:
+		return None
+	if entry.get("size") != st.st_size or entry.get("mtime") != st.st_mtime:
+		return None
+	if not isinstance(entry.get("title_id"), str) or not isinstance(entry.get("base_id"), str):
+		return None
+	if not isinstance(entry.get("version"), int) or isinstance(entry.get("version"), bool):
+		return None
+	try:
+		ContentType(entry.get("content_type"))
+	except ValueError:
+		return None
+	return entry
+
 # ── Core Rename Logic ──────────────────────────────────────────────────────────
 
 # If this many files IN A ROW all fail the same way, it's almost certainly a
@@ -810,6 +872,8 @@ def process_dirs(
 	keys_path:    Path,
 	max_consecutive_failures: int = DEFAULT_MAX_CONSECUTIVE_FAILURES,
 	progress:     ProgressLine | None = None,
+	full_scan:    bool = False,
+	cache:        dict | None = None,
 ) -> tuple[dict, list]:
 	"""
 	Three phases, so a title's real name is resolved (at most once per
@@ -847,11 +911,41 @@ def process_dirs(
 	  resolved name always replaces whatever name text is currently in
 	  the filename -- overwriting something that wasn't an obvious
 	  placeholder is logged as "NAME CHANGED" for easy auditing.
+
+	Verify-cache (skipped when full_scan=True): `cache` maps a file's own
+	path to the size/mtime/id/version/content-type/base-id hactool itself
+	confirmed for it on some PAST run (see cache_fingerprint). Before
+	Phase 1 touches hactool for a given file, cache_lookup checks for a
+	matching entry -- an exact size+mtime match means the file hasn't
+	changed since that past run actually verified it, so hactool would
+	just re-confirm what's already known. This is NOT filename-shape
+	trust (that was tried and rejected: a file can carry a fully
+	canonical-LOOKING name while its title is still wrong -- e.g. left
+	over from an old buggy pass, or a coincidence -- and shape alone can't
+	tell the two apart). Every cache entry instead comes from hactool
+	itself, so it can't mask a bad title the way shape-matching could.
+
+	A cache hit still gets a `records` entry (marked skip_rename=True) so
+	it can act as a Phase 2 name-resolution donor for a sibling that DOES
+	need one (e.g. new DLC added next to an already-verified BASE) --
+	using its cached id/base_id, no hactool call needed just for that.
+	Phase 2 itself still only spends a hactool call on a given base_id
+	group when at least one member of that group actually needs a rename;
+	a fully cache-hit group costs nothing. Phase 3 skips skip_rename
+	records outright (a cache hit is already known correct) and writes a
+	fresh cache entry for every file it newly confirms correct (whether
+	untouched or freshly renamed), so the next run benefits too. Pass
+	full_scan=True to ignore the cache on lookup (verify everything with
+	hactool regardless of past runs) -- the cache is still refreshed from
+	the results either way.
 	"""
 
+	if cache is None:
+		cache = {}
+
 	stats = {
-		"fixed": 0, "already_correct": 0, "unreadable": 0, "errors": 0,
-		"names_resolved": 0, "dlc_names_resolved": 0, "aborted_early": False,
+		"fixed": 0, "already_correct": 0, "fast_skipped": 0, "unreadable": 0,
+		"errors": 0, "names_resolved": 0, "dlc_names_resolved": 0, "aborted_early": False,
 	}
 	undo_log: list[dict] = []
 	consecutive_failures = 0
@@ -885,6 +979,26 @@ def process_dirs(
 			continue
 
 		for f in files:
+			cache_hit = None if full_scan else cache_lookup(cache, f)
+			if cache_hit is not None:
+				stats["already_correct"] += 1
+				stats["fast_skipped"] += 1
+				consecutive_failures = 0
+				records.append({
+					"path": f,
+					"title_id": cache_hit["title_id"],
+					"version": cache_hit["version"],
+					"content_type": ContentType(cache_hit["content_type"]),
+					"base_id": cache_hit["base_id"],
+					"name_part": "", "is_placeholder": False,
+					"existing_dlc_name": None, "dlc_own_name": None,
+					"skip_rename": True,
+				})
+				scanned += 1
+				if progress:
+					progress.update(scanned, f.name)
+				continue
+
 			try:
 				title_id, version, meta_type = extract_real_id_version(f, hactool_path, keys_path)
 			except HactoolError as exc:
@@ -919,6 +1033,7 @@ def process_dirs(
 					"content_type": content_type, "base_id": base_id,
 					"name_part": name_part, "is_placeholder": is_placeholder,
 					"existing_dlc_name": existing_dlc_name, "dlc_own_name": None,
+					"skip_rename": False,
 				})
 
 			scanned += 1
@@ -936,8 +1051,13 @@ def process_dirs(
 				return stats, undo_log
 
 	# --- Phase 2a: resolve each title's shared name, BASE files first ---
+	# Only worth a hactool call for a base_id group that has at least one
+	# member actually needing a rename decision -- a group made ENTIRELY
+	# of cache hits (skip_rename) is already fully correct, so resolving
+	# its name would be pure waste; it's never looked at in Phase 3.
+	base_ids_needing_resolution = {rec["base_id"] for rec in records if not rec["skip_rename"]}
 	if progress:
-		progress.reset(len({rec["base_id"] for rec in records}), "Resolving titles")
+		progress.reset(len(base_ids_needing_resolution), "Resolving titles")
 	titles_attempted = 0
 
 	def try_resolve(rec: dict) -> None:
@@ -955,14 +1075,19 @@ def process_dirs(
 			progress.update(titles_attempted, resolved or rec["path"].name)
 
 	for rec in records:
-		if rec["content_type"] == ContentType.BASE and rec["base_id"] not in name_cache:
+		if (rec["content_type"] == ContentType.BASE
+				and rec["base_id"] in base_ids_needing_resolution
+				and rec["base_id"] not in name_cache):
 			try_resolve(rec)
 	for rec in records:
-		if rec["base_id"] not in name_cache:
+		if rec["base_id"] in base_ids_needing_resolution and rec["base_id"] not in name_cache:
 			try_resolve(rec)
 
 	# --- Phase 2b: resolve each DLC's own name (distinct from the shared title) ---
-	dlc_records = [rec for rec in records if rec["content_type"] == ContentType.DLC]
+	# skip_rename (cache-hit) records are excluded -- they're already
+	# known correct and Phase 3 never looks at them, so resolving their
+	# own name would just be a wasted hactool call.
+	dlc_records = [rec for rec in records if rec["content_type"] == ContentType.DLC and not rec["skip_rename"]]
 	if progress:
 		progress.reset(len(dlc_records), "Resolving DLC names")
 
@@ -984,6 +1109,10 @@ def process_dirs(
 
 	for i, rec in enumerate(records, 1):
 		f = rec["path"]
+		if rec["skip_rename"]:
+			# Cache hit from Phase 1 -- already known correct, and its
+			# stats were already counted there. Nothing left to do.
+			continue
 		if progress:
 			progress.update(i, f.name)
 		title_id, version, content_type = rec["title_id"], rec["version"], rec["content_type"]
@@ -1042,7 +1171,13 @@ def process_dirs(
 
 		if new_path == f:
 			stats["already_correct"] += 1
+			cache[str(f)] = cache_fingerprint(f, title_id, version, content_type, rec["base_id"])
 			continue
+
+		# The file is about to change (or, in dry-run, has just been
+		# PROVEN not to match hactool's ground truth right now) -- any
+		# stale cache entry for its current path can no longer be trusted.
+		cache.pop(str(f), None)
 
 		if old_id and old_id != title_id:
 			log.warning("  ID MISMATCH  filename said [%s], real title id is [%s] -- correcting  %s",
@@ -1063,6 +1198,7 @@ def process_dirs(
 		if not dry_run:
 			f.rename(new_path)
 			undo_log.append({"from": str(new_path), "to": str(f)})
+			cache[str(new_path)] = cache_fingerprint(new_path, title_id, version, content_type, rec["base_id"])
 
 		stats["fixed"] += 1
 
@@ -1106,6 +1242,19 @@ def do_undo(undo_file: Path) -> None:
 FALLBACK_KEYS_PATH = Path("Z:/Games/Systems/Nintendo Switch/keys/prod.keys")
 
 
+def load_cache(cache_file: Path) -> dict:
+	"""Loads the verify-cache written by a past run (see cache_fingerprint).
+	Missing or unreadable/corrupt is just an empty cache -- everything
+	gets verified with hactool as normal, same as a first-ever run."""
+	if not cache_file.exists():
+		return {}
+	try:
+		return json.loads(cache_file.read_text(encoding="utf-8"))
+	except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+		log.warning("Ignoring unreadable verify-cache at %s (%s) -- starting fresh", cache_file, exc)
+		return {}
+
+
 def default_keys_path(script_dir: Path) -> Path:
 	for candidate in (
 		script_dir / "keys.txt",
@@ -1128,16 +1277,16 @@ def main() -> None:
 		epilog="""
 Examples:
   Dry-run a folder:
-	python rename_roms.py "Z:/Games/Systems/Nintendo Switch/roms"
+	python rename_roms.py --root "Z:/Games/Systems/Nintendo Switch/roms"
 
   Apply renames:
-	python rename_roms.py "Z:/Games/Systems/Nintendo Switch/roms" --apply
+	python rename_roms.py --root "Z:/Games/Systems/Nintendo Switch/roms" --apply
 
   Undo last apply:
-	python rename_roms.py "Z:/Games/Systems/Nintendo Switch/roms" --undo
+	python rename_roms.py --root "Z:/Games/Systems/Nintendo Switch/roms" --undo
 """,
 	)
-	parser.add_argument("dirs", nargs="+", metavar="DIR", help="ROM folder(s) to process")
+	parser.add_argument("--root", nargs="+", required=True, metavar="PATH", help="ROM folder(s) to process")
 	parser.add_argument("--apply", action="store_true", help="Apply renames (default is dry-run)")
 	parser.add_argument("--undo", action="store_true", help="Undo last --apply session")
 	parser.add_argument(
@@ -1158,12 +1307,19 @@ Examples:
 		help="Don't show the live progress bar (auto-disabled anyway when output isn't a terminal)",
 	)
 	parser.set_defaults(progress=True)
+	parser.add_argument(
+		"--full-scan", action="store_true",
+		help="Verify every file with hactool, ignoring rename_roms.cache.json (default: "
+			 "trust a file already confirmed correct by a past run, as long as its size "
+			 "and modified-time haven't changed since -- see cache_lookup in rename_roms.py)",
+	)
 	args = parser.parse_args()
 
-	rom_dirs   = [Path(d) for d in args.dirs]
+	rom_dirs   = [Path(d) for d in args.root]
 	script_dir = Path(__file__).parent
 	log_file   = script_dir / "rename_roms.log"
 	undo_file  = script_dir / "rename_roms.undo"
+	cache_file = script_dir / "rename_roms.cache.json"
 
 	progress = ProgressLine(enabled=None if args.progress else False)
 
@@ -1179,9 +1335,10 @@ Examples:
 
 	session = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 	log.info("===========================================")
-	log.info("  rename_roms.py v8 (hactool + name resolution)  |  session: %s", session)
+	log.info("  rename_roms.py v9 (hactool + name resolution + verify-cache)  |  session: %s", session)
 	log.info("  Dirs : %s", ", ".join(str(d) for d in rom_dirs))
 	log.info("  Mode : %s", "APPLY" if args.apply else "DRY-RUN")
+	log.info("  Scan : %s", "FULL (--full-scan, ignoring verify-cache)" if args.full_scan else "FAST (trust the verify-cache)")
 	log.info("===========================================")
 
 	if args.undo:
@@ -1213,15 +1370,22 @@ Examples:
 	log.info("===========================================")
 
 	dry_run = not args.apply
+	cache = load_cache(cache_file)
 	stats, undo_log = process_dirs(
 		rom_dirs, dry_run=dry_run, recursive=args.recursive,
 		hactool_path=hactool_path, keys_path=keys_path, progress=progress,
+		full_scan=args.full_scan, cache=cache,
 	)
+	try:
+		cache_file.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+	except OSError as exc:
+		log.warning("Could not save verify-cache to %s (%s) -- next run will re-verify more than necessary", cache_file, exc)
 
 	log.info("")
 	log.info("--- Summary ---")
 	log.info("  Fixed            : %d", stats["fixed"])
 	log.info("  Already correct  : %d", stats["already_correct"])
+	log.info("    fast-skipped   : %d  (verify-cache hit, no hactool call -- pass --full-scan to verify these too)", stats["fast_skipped"])
 	log.info("  Names resolved   : %d", stats["names_resolved"])
 	log.info("  DLC names resolved: %d", stats["dlc_names_resolved"])
 	log.info("  Unreadable       : %d", stats["unreadable"])

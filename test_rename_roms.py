@@ -431,6 +431,93 @@ class TestCanonicalTailRe(unittest.TestCase):
 		self.assertIsNone(m)
 
 
+class TestCacheFingerprintAndLookup(unittest.TestCase):
+	"""cache_fingerprint/cache_lookup are the hactool-free fast path's
+	building blocks: a fingerprint is only ever written from a REAL
+	hactool-verified result (see process_dirs), and a lookup only counts
+	as a hit when size+mtime still match the file on disk right now --
+	unlike a filename-shape check, this can never mistake a wrong-but-
+	plausible-looking name for a verified one, since nothing is trusted
+	until hactool itself vouched for it."""
+
+	def test_lookup_hits_when_fingerprint_matches_current_file(self):
+		with tempfile.TemporaryDirectory() as d:
+			p = Path(d) / "game.nsp"
+			p.write_bytes(b"hello")
+			entry = rr.cache_fingerprint(p, "0100EFD00A4FA000", 0, rr.ContentType.BASE, "0100EFD00A4FA000")
+			cache = {str(p): entry}
+			hit = rr.cache_lookup(cache, p)
+			self.assertIsNotNone(hit)
+			self.assertEqual(hit["title_id"], "0100EFD00A4FA000")
+			self.assertEqual(hit["content_type"], "BASE")
+
+	def test_lookup_misses_when_not_in_cache(self):
+		with tempfile.TemporaryDirectory() as d:
+			p = Path(d) / "game.nsp"
+			p.write_bytes(b"hello")
+			self.assertIsNone(rr.cache_lookup({}, p))
+
+	def test_lookup_misses_when_size_changed(self):
+		with tempfile.TemporaryDirectory() as d:
+			p = Path(d) / "game.nsp"
+			p.write_bytes(b"hello")
+			entry = rr.cache_fingerprint(p, "0100EFD00A4FA000", 0, rr.ContentType.BASE, "0100EFD00A4FA000")
+			p.write_bytes(b"hello world, now longer")  # content (and size) changed
+			self.assertIsNone(rr.cache_lookup({str(p): entry}, p))
+
+	def test_lookup_misses_when_mtime_changed(self):
+		with tempfile.TemporaryDirectory() as d:
+			p = Path(d) / "game.nsp"
+			p.write_bytes(b"hello")
+			entry = rr.cache_fingerprint(p, "0100EFD00A4FA000", 0, rr.ContentType.BASE, "0100EFD00A4FA000")
+			entry["mtime"] -= 100  # simulate the file having been touched since
+			self.assertIsNone(rr.cache_lookup({str(p): entry}, p))
+
+	def test_lookup_misses_when_file_no_longer_exists(self):
+		with tempfile.TemporaryDirectory() as d:
+			p = Path(d) / "game.nsp"
+			p.write_bytes(b"hello")
+			entry = rr.cache_fingerprint(p, "0100EFD00A4FA000", 0, rr.ContentType.BASE, "0100EFD00A4FA000")
+			p.unlink()
+			self.assertIsNone(rr.cache_lookup({str(p): entry}, p))
+
+	def test_lookup_treats_malformed_entry_as_a_miss_not_a_crash(self):
+		# rename_roms.cache.json is plain, user-editable JSON -- a bad
+		# entry (hand-edited, half-written, or from an incompatible future
+		# format) must degrade to "re-verify with hactool", never crash
+		# the whole run.
+		with tempfile.TemporaryDirectory() as d:
+			p = Path(d) / "game.nsp"
+			p.write_bytes(b"hello")
+			st = p.stat()
+			base = {"size": st.st_size, "mtime": st.st_mtime}
+
+			self.assertIsNone(rr.cache_lookup({str(p): {**base, "content_type": "NOT_A_REAL_TYPE",
+															"title_id": "X", "version": 0, "base_id": "X"}}, p))
+			self.assertIsNone(rr.cache_lookup({str(p): {**base, "content_type": "BASE",
+															"title_id": "X", "version": "not-an-int", "base_id": "X"}}, p))
+			self.assertIsNone(rr.cache_lookup({str(p): {**base, "content_type": "BASE", "base_id": "X"}}, p))  # missing title_id
+			self.assertIsNone(rr.cache_lookup({str(p): "not even a dict"}, p))
+
+
+class TestLoadCache(unittest.TestCase):
+	def test_missing_file_returns_empty_dict(self):
+		with tempfile.TemporaryDirectory() as d:
+			self.assertEqual(rr.load_cache(Path(d) / "nope.json"), {})
+
+	def test_valid_cache_file_loads(self):
+		with tempfile.TemporaryDirectory() as d:
+			p = Path(d) / "cache.json"
+			p.write_text('{"foo": {"size": 1, "mtime": 2.0}}', encoding="utf-8")
+			self.assertEqual(rr.load_cache(p), {"foo": {"size": 1, "mtime": 2.0}})
+
+	def test_corrupt_cache_file_returns_empty_dict_not_raise(self):
+		with tempfile.TemporaryDirectory() as d:
+			p = Path(d) / "cache.json"
+			p.write_text("{not valid json", encoding="utf-8")
+			self.assertEqual(rr.load_cache(p), {})
+
+
 class TestStripLeadingTitle(unittest.TestCase):
 	def test_strips_verbatim_prefix(self):
 		# Real case from this library: Capcom Arcade 2nd Stadium's DLC
@@ -1120,6 +1207,287 @@ class TestProcessDirsDryRunAndUndo(unittest.TestCase):
 			self.assertFalse(stats["aborted_early"])
 			self.assertEqual(stats["unreadable"], 5)
 			self.assertEqual(stats["fixed"], 5)
+
+
+class TestProcessDirsVerifyCache(unittest.TestCase):
+	"""process_dirs' default fast path: a file with a matching verify-cache
+	entry (see cache_fingerprint/cache_lookup) must never reach hactool
+	again, unless full_scan=True forces the old always-verify behavior.
+	Critically, a file that merely LOOKS canonical but has no cache entry
+	must still be fully verified -- that's the regression this class
+	guards (test_dlc_with_non_prefix_sharing_id_still_reaches_shared_name
+	in TestProcessDirsNameResolution caught the earlier filename-shape-
+	trust design doing exactly the wrong thing here)."""
+
+	def test_cache_hit_skips_hactool_entirely(self):
+		with tempfile.TemporaryDirectory() as d:
+			rom_dir = Path(d) / "roms"
+			rom_dir.mkdir()
+			stem = rr.build_new_stem("Test Game", "0100EFD00A4FA000", 0, rr.ContentType.BASE)
+			f = rom_dir / f"{stem}.nsp"
+			f.write_bytes(b"x")
+			cache = {str(f): rr.cache_fingerprint(f, "0100EFD00A4FA000", 0, rr.ContentType.BASE, "0100EFD00A4FA000")}
+
+			def fails_if_called(path, hactool_path, keys_path):
+				raise AssertionError("hactool should never be invoked for a verify-cache hit")
+
+			orig = rr.extract_real_id_version
+			rr.extract_real_id_version = fails_if_called
+			try:
+				stats, undo_log = rr.process_dirs(
+					[rom_dir], dry_run=True, recursive=False,
+					hactool_path=Path("unused"), keys_path=Path("unused"),
+					cache=cache,
+				)
+			finally:
+				rr.extract_real_id_version = orig
+
+			self.assertEqual(stats["already_correct"], 1)
+			self.assertEqual(stats["fast_skipped"], 1)
+			self.assertEqual(stats["fixed"], 0)
+			self.assertTrue(f.exists())
+
+	def test_canonical_looking_name_without_cache_entry_is_still_verified(self):
+		# The regression case: a name that already LOOKS fully canonical
+		# must NOT be trusted just because of its shape -- only an actual
+		# cache hit (hactool-verified on a past run) may skip hactool.
+		with tempfile.TemporaryDirectory() as d:
+			rom_dir = Path(d) / "roms"
+			rom_dir.mkdir()
+			stem = rr.build_new_stem("Wrong Leftover Title", "0100EFD00A4FA000", 0, rr.ContentType.BASE)
+			f = rom_dir / f"{stem}.nsp"
+			f.write_bytes(b"x")
+
+			call_count = {"n": 0}
+			def fake_extract(path, hactool_path, keys_path):
+				call_count["n"] += 1
+				return ("0100EFD00A4FA000", 0, rr.CONTENT_META_TYPE_APPLICATION)
+
+			orig = rr.extract_real_id_version
+			rr.extract_real_id_version = fake_extract
+			try:
+				stats, undo_log = rr.process_dirs(
+					[rom_dir], dry_run=True, recursive=False,
+					hactool_path=Path("unused"), keys_path=Path("unused"),
+					cache={},  # empty -- nothing has ever been verified
+				)
+			finally:
+				rr.extract_real_id_version = orig
+
+			self.assertEqual(call_count["n"], 1)
+			self.assertEqual(stats["fast_skipped"], 0)
+
+	def test_stale_cache_entry_triggers_reverify(self):
+		with tempfile.TemporaryDirectory() as d:
+			rom_dir = Path(d) / "roms"
+			rom_dir.mkdir()
+			stem = rr.build_new_stem("Test Game", "0100EFD00A4FA000", 0, rr.ContentType.BASE)
+			f = rom_dir / f"{stem}.nsp"
+			f.write_bytes(b"x")
+			entry = rr.cache_fingerprint(f, "0100EFD00A4FA000", 0, rr.ContentType.BASE, "0100EFD00A4FA000")
+			entry["size"] = 999999  # doesn't match the real file anymore
+			cache = {str(f): entry}
+
+			call_count = {"n": 0}
+			def fake_extract(path, hactool_path, keys_path):
+				call_count["n"] += 1
+				return ("0100EFD00A4FA000", 0, rr.CONTENT_META_TYPE_APPLICATION)
+
+			orig = rr.extract_real_id_version
+			rr.extract_real_id_version = fake_extract
+			try:
+				rr.process_dirs(
+					[rom_dir], dry_run=True, recursive=False,
+					hactool_path=Path("unused"), keys_path=Path("unused"),
+					cache=cache,
+				)
+			finally:
+				rr.extract_real_id_version = orig
+
+			self.assertEqual(call_count["n"], 1)
+
+	def test_full_scan_ignores_cache_hit(self):
+		with tempfile.TemporaryDirectory() as d:
+			rom_dir = Path(d) / "roms"
+			rom_dir.mkdir()
+			stem = rr.build_new_stem("Test Game", "0100EFD00A4FA000", 0, rr.ContentType.BASE)
+			f = rom_dir / f"{stem}.nsp"
+			f.write_bytes(b"x")
+			cache = {str(f): rr.cache_fingerprint(f, "0100EFD00A4FA000", 0, rr.ContentType.BASE, "0100EFD00A4FA000")}
+
+			call_count = {"n": 0}
+			def fake_extract(path, hactool_path, keys_path):
+				call_count["n"] += 1
+				return ("0100EFD00A4FA000", 0, rr.CONTENT_META_TYPE_APPLICATION)
+
+			orig = rr.extract_real_id_version
+			rr.extract_real_id_version = fake_extract
+			try:
+				stats, undo_log = rr.process_dirs(
+					[rom_dir], dry_run=True, recursive=False,
+					hactool_path=Path("unused"), keys_path=Path("unused"),
+					cache=cache, full_scan=True,
+				)
+			finally:
+				rr.extract_real_id_version = orig
+
+			self.assertEqual(call_count["n"], 1)
+			self.assertEqual(stats["fast_skipped"], 0)
+			# full_scan still refreshes the cache from the fresh result.
+			self.assertIn(str(f), cache)
+
+	def test_successful_run_populates_cache_for_already_correct_and_renamed(self):
+		with tempfile.TemporaryDirectory() as d:
+			rom_dir = Path(d) / "roms"
+			rom_dir.mkdir()
+			already_correct_stem = rr.build_new_stem("Test Game", "0100EFD00A4FA000", 0, rr.ContentType.BASE)
+			already_correct_f = rom_dir / f"{already_correct_stem}.nsp"
+			already_correct_f.write_bytes(b"x")
+			messy_f = rom_dir / "Unrecognized [0100BBBBBBBB0000].nsp"
+			messy_f.write_bytes(b"x")
+
+			fake_results = {
+				str(already_correct_f): ("0100EFD00A4FA000", 0, rr.CONTENT_META_TYPE_APPLICATION),
+				str(messy_f): ("0100BBBBBBBB0000", 0, rr.CONTENT_META_TYPE_APPLICATION),
+			}
+			orig = rr.extract_real_id_version
+			rr.extract_real_id_version = lambda path, h, k: fake_results[str(path)]
+			try:
+				cache = {}
+				stats, undo_log = rr.process_dirs(
+					[rom_dir], dry_run=False, recursive=False,
+					hactool_path=Path("unused"), keys_path=Path("unused"),
+					cache=cache,
+				)
+			finally:
+				rr.extract_real_id_version = orig
+
+			# The already-correct file is cached under its untouched path.
+			self.assertIn(str(already_correct_f), cache)
+			self.assertEqual(cache[str(already_correct_f)]["title_id"], "0100EFD00A4FA000")
+
+			# The renamed file is cached under its NEW path, not the old one.
+			new_messy_path = rom_dir / "Unrecognized [0100BBBBBBBB0000] [BASE][v0].nsp"
+			self.assertIn(str(new_messy_path), cache)
+			self.assertNotIn(str(messy_f), cache)
+			self.assertEqual(cache[str(new_messy_path)]["base_id"], "0100BBBBBBBB0000")
+
+	def test_dry_run_pending_rename_is_not_cached(self):
+		# A file dry-run determined needs a rename isn't actually correct
+		# yet -- caching it (under either the old or a not-yet-real new
+		# path) would let a later fast run wrongly trust it.
+		with tempfile.TemporaryDirectory() as d:
+			rom_dir = Path(d) / "roms"
+			rom_dir.mkdir()
+			f = rom_dir / "Unrecognized [0100BBBBBBBB0000].nsp"
+			f.write_bytes(b"x")
+
+			orig = rr.extract_real_id_version
+			rr.extract_real_id_version = lambda path, h, k: ("0100BBBBBBBB0000", 0, rr.CONTENT_META_TYPE_APPLICATION)
+			try:
+				cache = {}
+				rr.process_dirs(
+					[rom_dir], dry_run=True, recursive=False,
+					hactool_path=Path("unused"), keys_path=Path("unused"),
+					cache=cache,
+				)
+			finally:
+				rr.extract_real_id_version = orig
+
+			self.assertEqual(cache, {})
+
+	def test_cache_hit_base_can_still_donate_name_to_new_sibling(self):
+		# Closes the gap a naive "exclude fast-skipped files from grouping
+		# entirely" design would have: a BASE file that's a cache hit (so
+		# its OWN id/version is never re-verified) can still act as the
+		# Phase 2 donor for a sibling DLC that genuinely needs a name,
+		# using its cached base_id -- no re-verification of the BASE
+		# file's own id/version required for that to work.
+		with tempfile.TemporaryDirectory() as d:
+			rom_dir = Path(d) / "roms"
+			rom_dir.mkdir()
+			base_f = rom_dir / "Some Game [0100AAAA00000000] [BASE][v0].nsp"
+			base_f.write_bytes(b"x")
+			dlc_f = rom_dir / "Unrecognized [0100AAAA00000001].nsp"
+			dlc_f.write_bytes(b"x")
+
+			cache = {str(base_f): rr.cache_fingerprint(
+				base_f, "0100AAAA00000000", 0, rr.ContentType.BASE, "0100AAAA00000000",
+			)}
+
+			def fails_if_base(path, hactool_path, keys_path):
+				raise AssertionError("BASE file's id/version must not be re-verified on a cache hit")
+			def dlc_id_version(path, hactool_path, keys_path):
+				return ("0100AAAA00000001", 0, rr.CONTENT_META_TYPE_ADD_ON_CONTENT)
+
+			orig_id = rr.extract_real_id_version
+			orig_base_id = rr.extract_real_base_id
+			orig_content = rr.extract_content_entries
+			orig_name = rr.extract_title_name
+			rr.extract_real_id_version = lambda path, h, k: (
+				fails_if_base(path, h, k) if path == base_f else dlc_id_version(path, h, k)
+			)
+			rr.extract_real_base_id = lambda path, h, k, title_id, meta_type: "0100AAAA00000000"
+			rr.extract_content_entries = lambda path, h, k: []
+			rr.extract_title_name = lambda path, h, k, entries: (
+				"Resolved Shared Title" if str(path) == str(base_f) else None
+			)
+			try:
+				stats, undo_log = rr.process_dirs(
+					[rom_dir], dry_run=True, recursive=False,
+					hactool_path=Path("unused"), keys_path=Path("unused"),
+					cache=cache,
+				)
+			finally:
+				rr.extract_real_id_version = orig_id
+				rr.extract_real_base_id = orig_base_id
+				rr.extract_content_entries = orig_content
+				rr.extract_title_name = orig_name
+
+			self.assertEqual(stats["names_resolved"], 1)
+			self.assertEqual(stats["fixed"], 1)
+			# base_f itself is untouched (its cached name was already correct).
+			self.assertTrue(base_f.exists())
+
+	def test_fully_cached_title_group_never_calls_name_resolution(self):
+		# When every file sharing a base_id is a cache hit, nothing in
+		# that group needs a name -- resolving one anyway would be a pure
+		# wasted hactool call.
+		with tempfile.TemporaryDirectory() as d:
+			rom_dir = Path(d) / "roms"
+			rom_dir.mkdir()
+			base_f = rom_dir / "Some Game [0100AAAA00000000] [BASE][v0].nsp"
+			base_f.write_bytes(b"x")
+			upd_f = rom_dir / "Some Game [0100AAAA00000800] [UPDATE][v65536].nsp"
+			upd_f.write_bytes(b"x")
+
+			cache = {
+				str(base_f): rr.cache_fingerprint(base_f, "0100AAAA00000000", 0, rr.ContentType.BASE, "0100AAAA00000000"),
+				str(upd_f): rr.cache_fingerprint(upd_f, "0100AAAA00000800", 65536, rr.ContentType.UPDATE, "0100AAAA00000000"),
+			}
+
+			def fails_if_called(*a, **k):
+				raise AssertionError("no hactool call should be needed for a fully cache-hit title group")
+
+			orig_id = rr.extract_real_id_version
+			orig_content = rr.extract_content_entries
+			orig_name = rr.extract_title_name
+			rr.extract_real_id_version = fails_if_called
+			rr.extract_content_entries = fails_if_called
+			rr.extract_title_name = fails_if_called
+			try:
+				stats, undo_log = rr.process_dirs(
+					[rom_dir], dry_run=True, recursive=False,
+					hactool_path=Path("unused"), keys_path=Path("unused"),
+					cache=cache,
+				)
+			finally:
+				rr.extract_real_id_version = orig_id
+				rr.extract_content_entries = orig_content
+				rr.extract_title_name = orig_name
+
+			self.assertEqual(stats["fast_skipped"], 2)
+			self.assertEqual(stats["names_resolved"], 0)
 
 
 class TestProcessDirsNameResolution(unittest.TestCase):

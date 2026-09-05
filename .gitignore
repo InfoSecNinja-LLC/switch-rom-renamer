@@ -14,6 +14,7 @@ hactoolnet.exe
 # Runtime artifacts
 *.log
 *.undo
+rename_roms.cache.json
 nswdb_cache.xml
 
 # Python

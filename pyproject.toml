@@ -3,7 +3,9 @@ name = "switch-rom-renamer"
 version = "0.1.0"
 description = "Renames Nintendo Switch ROM dumps into a canonical filename from their own metadata"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "send2trash>=1.8.0",
+]
 
 [tool.uv]
 package = false
