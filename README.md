@@ -261,13 +261,14 @@ supported the same way as base games/updates.
 
 ## ROM Cleanup Script
 
-A new script `cleanup_switch_roms.py` is available to clean up your ROM collection by:
+A separate script, `cleanup_switch_roms.py`, cleans up a ROM collection by:
 - Removing duplicate DLC files (based on file hash)
-- Keeping only the latest update for each game
 - Moving older files to the recycle bin
-- Removing duplicates with exact same name across filetypes (.nsp vs .nsz)
+- Removing duplicates of the same title across filetypes (e.g. `.nsp` vs `.nsz`)
+
+Supports `.nsp`, `.xci`, and `.nsz` (no `.xcz`, and NCA is no longer supported).
 
 Usage:
 ```
-python cleanup_switch_roms.py "K:\Games\Systems\Nintendo Switch\roms" [--dry-run]
+python cleanup_switch_roms.py --root "K:\Games\Systems\Nintendo Switch\roms" [--dry-run]
 ```

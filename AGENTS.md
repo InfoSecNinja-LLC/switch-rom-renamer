@@ -5,7 +5,7 @@
 ## Project Structure & Module Organization
 
 - `rename_roms.py` — the main renamer script (container parsing, CNMT/NACP parsing, hactool invocation, verify-cache, dry-run/apply/undo).
-- `cleanup_switch_roms.py` — auxiliary script to remove duplicate DLC, keep only the latest update, and recycle-bin older files.
+- `cleanup_switch_roms.py` — auxiliary script to remove duplicate DLC (by file hash), remove duplicates of the same title across filetypes (e.g. `.nsp` vs `.nsz`), and recycle-bin older files. Supports `.nsp`/`.xci`/`.nsz` (no `.xcz`, no NCA).
 - `test_rename_roms.py` — `unittest` suite for the parsers and pipelines (uses stubs, no hactool/keys/ROMs required).
 - `pyproject.toml` + `uv.lock` — dependency management (`send2trash`; `[tool.uv] package = false`).
 - Runtime/local (do not commit): `hactool.exe`, `.keys/`, `rename_roms.cache.json`, `rename_roms.log`, `rename_roms.undo`, `cleanup_roms.log`.
@@ -32,7 +32,7 @@ uv run rename_roms.py "Z:/.../roms" --hactool ".\hactool.exe" --keys ".\.keys\pr
 Run the cleanup script:
 
 ```cmd
-python cleanup_switch_roms.py "K:\Games\Systems\Nintendo Switch\roms" --dry-run
+python cleanup_switch_roms.py --root "K:\Games\Systems\Nintendo Switch\roms" --dry-run
 ```
 
 Run the tests:
